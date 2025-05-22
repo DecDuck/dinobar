@@ -74,7 +74,7 @@ fn throw_on_fcpattern_result(res: FcResult) {
             panic!("Out of memory");
         }
         r => {
-            panic!("Unknown fontconfig return value {:?}", r)
+            panic!("Unknown fontconfig return value {r:?}")
         }
     }
 }

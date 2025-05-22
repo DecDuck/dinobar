@@ -1,487 +1,188 @@
-use anyhow::{anyhow, Result};
-use cairo::{Antialias, Context, Format, ImageSurface, Surface};
-use chrono::{Local, Locale, Timelike};
+/**
+ * I was drunk when I wrote this.
+ */
+use anyhow::Result;
+use cairo::{Antialias, Context, FontFace, Format, ImageSurface, Pattern, Surface};
 use drm::control::ClipRect;
-use freedesktop_icons::lookup;
+use fonts::FontConfig;
+use freetype::Library as FtLibrary;
 use input::{
     event::{
         device::DeviceEvent,
-        keyboard::{KeyState, KeyboardEvent, KeyboardEventTrait},
-        touch::{TouchEvent, TouchEventPosition, TouchEventSlot},
+        touch::{TouchEvent, TouchEventPosition},
         Event, EventTrait,
     },
     Device as InputDevice, Libinput, LibinputInterface,
 };
-use input_linux::{uinput::UInputHandle, EventKind, Key, SynchronizeKind};
-use input_linux_sys::{input_event, input_id, timeval, uinput_setup};
 use libc::{c_char, O_ACCMODE, O_RDONLY, O_RDWR, O_WRONLY};
-use librsvg_rebind::{prelude::HandleExt, Handle, Rectangle};
-use nix::{
-    errno::Errno,
-    sys::{
-        epoll::{Epoll, EpollCreateFlags, EpollEvent, EpollFlags},
-        signal::{SigSet, Signal},
-    },
+use nix::sys::{
+    epoll::{Epoll, EpollCreateFlags, EpollEvent, EpollFlags},
+    signal::{SigSet, Signal},
 };
-use privdrop::PrivDrop;
+use rand::Rng;
 use std::{
-    cmp::min,
-    collections::HashMap,
     fs::{File, OpenOptions},
+    io::Read,
     os::{
-        fd::{AsFd, AsRawFd},
+        fd::AsFd,
         unix::{fs::OpenOptionsExt, io::OwnedFd},
     },
     panic::{self, AssertUnwindSafe},
-    path::{Path, PathBuf},
+    path::Path,
+    thread,
+    time::{Duration, Instant},
 };
 
-mod backlight;
-mod config;
 mod display;
 mod fonts;
-mod pixel_shift;
 
-use crate::config::ConfigManager;
-use backlight::BacklightManager;
-use config::{ButtonConfig, Config};
 use display::DrmBackend;
-use pixel_shift::{PixelShiftManager, PIXEL_SHIFT_WIDTH_PX};
 
-const BUTTON_SPACING_PX: i32 = 16;
-const BUTTON_COLOR_INACTIVE: f64 = 0.200;
-const BUTTON_COLOR_ACTIVE: f64 = 0.400;
-const ICON_SIZE: i32 = 48;
-const TIMEOUT_MS: i32 = 10 * 1000;
-
-enum ButtonImage {
-    Text(String),
-    Svg(Handle),
-    Bitmap(ImageSurface),
-    Time(String, String),
-}
-
-struct Button {
-    image: ButtonImage,
-    changed: bool,
-    active: bool,
-    action: Key,
-}
-
-fn try_load_svg(path: &str) -> Result<ButtonImage> {
-    Ok(ButtonImage::Svg(
-        Handle::from_file(path)?.ok_or(anyhow!("failed to load image"))?,
-    ))
-}
-
-fn try_load_png(path: impl AsRef<Path>) -> Result<ButtonImage> {
-    let mut file = File::open(path)?;
-    let surf = ImageSurface::create_from_png(&mut file)?;
-    if surf.height() == ICON_SIZE && surf.width() == ICON_SIZE {
-        return Ok(ButtonImage::Bitmap(surf));
+fn try_load_png<R>(mut data: R, icon_size: i32) -> Result<ImageSurface>
+where
+    R: Read,
+{
+    let surf = ImageSurface::create_from_png(&mut data)?;
+    if surf.height() == icon_size && surf.width() == icon_size {
+        return Ok(surf);
     }
-    let resized = ImageSurface::create(Format::ARgb32, ICON_SIZE, ICON_SIZE).unwrap();
+    let resized = ImageSurface::create(Format::ARgb32, icon_size, icon_size).unwrap();
     let c = Context::new(&resized).unwrap();
     c.scale(
-        ICON_SIZE as f64 / surf.width() as f64,
-        ICON_SIZE as f64 / surf.height() as f64,
+        icon_size as f64 / surf.width() as f64,
+        icon_size as f64 / surf.height() as f64,
     );
     c.set_source_surface(surf, 0.0, 0.0).unwrap();
     c.set_antialias(Antialias::Best);
     c.paint().unwrap();
-    Ok(ButtonImage::Bitmap(resized))
+    Ok(resized)
 }
 
-fn try_load_image(name: impl AsRef<str>, theme: Option<impl AsRef<str>>) -> Result<ButtonImage> {
-    let name = name.as_ref();
-    let locations;
+pub struct Scene {
+    drawables: Vec<Drawable>,
+    fontface: FontFace,
+}
 
-    // Load list of candidate locations
-    if let Some(theme) = theme {
-        // Freedesktop icons
-        let theme = theme.as_ref();
-        let candidates = vec![
-            lookup(name)
-                .with_cache()
-                .with_theme(theme)
-                .with_size(ICON_SIZE as u16)
-                .force_svg()
-                .find(),
-            lookup(name)
-                .with_cache()
-                .with_theme(theme)
-                .force_svg()
-                .find(),
-        ];
+#[derive(Debug, Clone)]
+pub struct Drawable {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+    pub color: (f64, f64, f64),
+    pub surface: Option<ImageSurface>,
+    pub needs_redraw: bool,
+}
 
-        // .flatten() removes `None` and unwraps `Some` values
-        locations = candidates.into_iter().flatten().collect();
-    } else {
-        // Standard file icons
-        locations = vec![
-            PathBuf::from(format!("/etc/tiny-dfr/{name}.svg")),
-            PathBuf::from(format!("/etc/tiny-dfr/{name}.png")),
-            PathBuf::from(format!("/usr/share/tiny-dfr/{name}.svg")),
-            PathBuf::from(format!("/usr/share/tiny-dfr/{name}.png")),
-        ];
+impl Drawable {
+    fn new(
+        x: f64,
+        y: f64,
+        width: f64,
+        height: f64,
+        color: (f64, f64, f64),
+        surface: Option<ImageSurface>,
+    ) -> Self {
+        Self {
+            x,
+            y,
+            width,
+            height,
+            color,
+            needs_redraw: true,
+            surface,
+        }
+    }
+}
+
+impl Scene {
+    fn new(dino: ImageSurface, cactus: ImageSurface) -> Scene {
+        let mut drawables = vec![Drawable::new(
+            0.0,
+            0.0,
+            9.0,
+            9.0,
+            (1.0, 1.0, 1.0),
+            Some(dino),
+        )];
+
+        let w = cactus.width() as f64;
+        let h = cactus.height() as f64;
+        let value = Some(cactus);
+        for _i in 0..20 {
+            drawables.push(Drawable {
+                x: -w,
+                y: 0.0,
+                width: w,
+                height: h,
+                color: (0.0, 1.0, 0.0),
+                needs_redraw: false,
+                surface: value.clone(),
+            });
+        }
+
+        let fc = FontConfig::new();
+        let mut pt = fonts::Pattern::new("Adwaita Mono");
+        fc.perform_substitutions(&mut pt);
+        let pat_match = match fc.match_pattern(&pt) {
+        Ok(pat) => pat,
+        Err(_) => panic!("Unable to find specified font. If you are using the default config, make sure you have at least one font installed")
     };
+        let file_name = pat_match.get_file_name();
+        let file_idx = pat_match.get_font_index();
+        let ft_library = FtLibrary::init().unwrap();
+        let face = ft_library.new_face(file_name, file_idx).unwrap();
+        let fontface = FontFace::create_from_ft(&face).unwrap();
 
-    // Try to load each candidate
-    let mut last_err = anyhow!("no suitable icon path was found"); // in case locations is empty
-
-    for location in locations {
-        let result = match location.extension().and_then(|s| s.to_str()) {
-            Some("png") => try_load_png(&location),
-            Some("svg") => try_load_svg(
-                location
-                    .to_str()
-                    .ok_or(anyhow!("image path is not unicode"))?,
-            ),
-            _ => Err(anyhow!("invalid file extension")),
-        };
-
-        match result {
-            Ok(image) => return Ok(image),
-            Err(err) => {
-                last_err = err.context(format!("while loading path {}", location.display()));
-            }
-        };
-    }
-
-    // if function hasn't returned by now, all sources have been exhausted
-    Err(last_err.context(format!("failed loading all possible paths for icon {name}")))
-}
-
-impl Button {
-    fn with_config(cfg: ButtonConfig) -> Button {
-        if let Some(text) = cfg.text {
-            Button::new_text(text, cfg.action)
-        } else if let Some(icon) = cfg.icon {
-            Button::new_icon(&icon, cfg.theme, cfg.action)
-        } else if let Some(time) = cfg.time {
-            let locale = match cfg.locale {
-                 Some(l) => l,
-                 None => "POSIX".to_string()
-            };
-            Button::new_time(cfg.action, time, locale)
-        } else {
-            panic!("Invalid config, a button must have either Text, Icon or Time")
-        }
-    }
-    fn new_text(text: String, action: Key) -> Button {
-        Button {
-            action,
-            active: false,
-            changed: false,
-            image: ButtonImage::Text(text),
-        }
-    }
-    fn new_icon(path: impl AsRef<str>, theme: Option<impl AsRef<str>>, action: Key) -> Button {
-        let image = try_load_image(path, theme).expect("failed to load icon");
-        Button {
-            action,
-            image,
-            active: false,
-            changed: false,
+        Scene {
+            drawables,
+            fontface,
         }
     }
 
-    fn new_time(action: Key, format: String, locale: String) -> Button {
-        Button {
-            action,
-            active: false,
-            changed: false,
-            image: ButtonImage::Time(format, locale),
-        }
-    }
-    fn render(
-        &self,
-        c: &Context,
-        height: i32,
-        button_left_edge: f64,
-        button_width: u64,
-        y_shift: f64,
-    ) {
-        match &self.image {
-            ButtonImage::Text(text) => {
-                let extents = c.text_extents(text).unwrap();
-                c.move_to(
-                    button_left_edge + (button_width as f64 / 2.0 - extents.width() / 2.0).round(),
-                    y_shift + (height as f64 / 2.0 + extents.height() / 2.0).round(),
-                );
-                c.show_text(text).unwrap();
-            }
-            ButtonImage::Svg(svg) => {
-                let x =
-                    button_left_edge + (button_width as f64 / 2.0 - (ICON_SIZE / 2) as f64).round();
-                let y = y_shift + ((height as f64 - ICON_SIZE as f64) / 2.0).round();
-
-                svg.render_document(c, &Rectangle::new(x, y, ICON_SIZE as f64, ICON_SIZE as f64))
-                    .unwrap();
-            }
-            ButtonImage::Bitmap(surf) => {
-                let x =
-                    button_left_edge + (button_width as f64 / 2.0 - (ICON_SIZE / 2) as f64).round();
-                let y = y_shift + ((height as f64 - ICON_SIZE as f64) / 2.0).round();
-                c.set_source_surface(surf, x, y).unwrap();
-                c.rectangle(x, y, ICON_SIZE as f64, ICON_SIZE as f64);
-                c.fill().unwrap();
-            }
-            ButtonImage::Time(format, locale) => {
-                 let current_time = Local::now();
-                 let current_locale = Locale::try_from(locale.as_str()).unwrap_or(Locale::POSIX);
-                 let formatted_time;
-                 if format == "24hr" {
-                     formatted_time = format!(
-                     "{}:{}    {} {} {}",
-                      current_time.format_localized("%H", current_locale),
-                      current_time.format_localized("%M", current_locale),
-                      current_time.format_localized("%a", current_locale),
-                      current_time.format_localized("%-e", current_locale),
-                      current_time.format_localized("%b", current_locale)
-                 );
-                 } else {
-                     formatted_time = format!(
-                     "{}:{} {}    {} {} {}",
-                     current_time.format_localized("%-l", current_locale),
-                     current_time.format_localized("%M", current_locale),
-                     current_time.format_localized("%p", current_locale),
-                     current_time.format_localized("%a", current_locale),
-                     current_time.format_localized("%-e", current_locale),
-                     current_time.format_localized("%b", current_locale)
-                 );
-                 }
-                 let time_extents = c.text_extents(&formatted_time).unwrap();
-                 c.move_to(
-                     button_left_edge + (button_width as f64 / 2.0 - time_extents.width() / 2.0).round(),
-                     y_shift + (height as f64 / 2.0 + time_extents.height() / 2.0).round()
-                 );
-                 c.show_text(&formatted_time).unwrap();
-             }
-        }
-    }
-    fn set_active<F>(&mut self, uinput: &mut UInputHandle<F>, active: bool)
-    where
-        F: AsRawFd,
-    {
-        if self.active != active {
-            self.active = active;
-            self.changed = true;
-
-            toggle_key(uinput, self.action, active as i32);
-        }
-    }
-}
-
-#[derive(Default)]
-pub struct FunctionLayer {
-    buttons: Vec<(usize, Button)>,
-    virtual_button_count: usize,
-}
-
-impl FunctionLayer {
-    fn with_config(cfg: Vec<ButtonConfig>) -> FunctionLayer {
-        if cfg.is_empty() {
-            panic!("Invalid configuration, layer has 0 buttons");
-        }
-
-        let mut virtual_button_count = 0;
-        FunctionLayer {
-            buttons: cfg
-                .into_iter()
-                .scan(&mut virtual_button_count, |state, cfg| {
-                    let i = **state;
-                    let mut stretch = cfg.stretch.unwrap_or(1);
-                    if stretch < 1 {
-                        println!("Stretch value must be at least 1, setting to 1.");
-                        stretch = 1;
-                    }
-                    if cfg.time.is_some() {
-                        stretch = stretch * 3;
-                    }
-                    **state += stretch;
-                    Some((i, Button::with_config(cfg)))
-                })
-                .collect(),
-            virtual_button_count,
-        }
-    }
     fn draw(
         &mut self,
-        config: &Config,
         width: i32,
         height: i32,
         surface: &Surface,
-        pixel_shift: (f64, f64),
-        complete_redraw: bool,
+        time: &TimeStep,
     ) -> Vec<ClipRect> {
         let c = Context::new(surface).unwrap();
-        let mut modified_regions = if complete_redraw {
-            vec![ClipRect::new(0, 0, height as u16, width as u16)]
-        } else {
-            Vec::new()
-        };
+        let modified_regions = Vec::new();
         c.translate(height as f64, 0.0);
         c.rotate((90.0f64).to_radians());
-        let pixel_shift_width = if config.enable_pixel_shift {
-            PIXEL_SHIFT_WIDTH_PX
-        } else {
-            0
-        };
-        let virtual_button_width = ((width - pixel_shift_width as i32)
-            - (BUTTON_SPACING_PX * (self.virtual_button_count - 1) as i32))
-            as f64
-            / self.virtual_button_count as f64;
-        let radius = 8.0f64;
-        let bot = (height as f64) * 0.15;
-        let top = (height as f64) * 0.85;
-        let (pixel_shift_x, pixel_shift_y) = pixel_shift;
 
-        if complete_redraw {
-            c.set_source_rgb(0.0, 0.0, 0.0);
-            c.paint().unwrap();
-        }
-        c.set_font_face(&config.font_face);
-        c.set_font_size(32.0);
+        c.set_source_rgb(0.0, 0.0, 0.0);
+        c.paint().unwrap();
 
-        for i in 0..self.buttons.len() {
-            let end = if i + 1 < self.buttons.len() {
-                self.buttons[i + 1].0
+        for drawable in self.drawables.iter_mut() {
+            let x = drawable.x;
+            let y = height as f64 - drawable.y;
+            if let Some(surface) = &drawable.surface {
+                let y = y - surface.height() as f64;
+                c.set_source_surface(surface, x, y).unwrap();
+                c.rectangle(x, y, surface.width() as f64, surface.height() as f64);
             } else {
-                self.virtual_button_count
-            };
-            let (start, button) = &mut self.buttons[i];
-            let start = *start;
-
-            if !button.changed && !complete_redraw {
-                continue;
-            };
-
-            let left_edge = (start as f64 * (virtual_button_width + BUTTON_SPACING_PX as f64))
-                .floor()
-                + pixel_shift_x
-                + (pixel_shift_width / 2) as f64;
-
-            let button_width = virtual_button_width
-                + ((end - start - 1) as f64 * (virtual_button_width + BUTTON_SPACING_PX as f64))
-                    .floor();
-
-            let color = if button.active {
-                BUTTON_COLOR_ACTIVE
-            } else if config.show_button_outlines {
-                BUTTON_COLOR_INACTIVE
-            } else {
-                0.0
-            };
-            if !complete_redraw {
-                c.set_source_rgb(0.0, 0.0, 0.0);
-                c.rectangle(
-                    left_edge,
-                    bot - radius,
-                    button_width,
-                    top - bot + radius * 2.0,
-                );
-                c.fill().unwrap();
+                c.set_source_rgb(drawable.color.0, drawable.color.1, drawable.color.2);
+                c.rectangle(x, y - drawable.height, drawable.width, drawable.height);
             }
-            c.set_source_rgb(color, color, color);
-            // draw box with rounded corners
-            c.new_sub_path();
-            let left = left_edge + radius;
-            let right = (left_edge + button_width.ceil()) - radius;
-            c.arc(
-                right,
-                bot,
-                radius,
-                (-90.0f64).to_radians(),
-                (0.0f64).to_radians(),
-            );
-            c.arc(
-                right,
-                top,
-                radius,
-                (0.0f64).to_radians(),
-                (90.0f64).to_radians(),
-            );
-            c.arc(
-                left,
-                top,
-                radius,
-                (90.0f64).to_radians(),
-                (180.0f64).to_radians(),
-            );
-            c.arc(
-                left,
-                bot,
-                radius,
-                (180.0f64).to_radians(),
-                (270.0f64).to_radians(),
-            );
-            c.close_path();
 
             c.fill().unwrap();
-            c.set_source_rgb(1.0, 1.0, 1.0);
-            button.render(
-                &c,
-                height,
-                left_edge,
-                button_width.ceil() as u64,
-                pixel_shift_y,
-            );
 
-            button.changed = false;
-
-            if !complete_redraw {
-                modified_regions.push(ClipRect::new(
-                    height as u16 - top as u16 - radius as u16,
-                    left_edge as u16,
-                    height as u16 - bot as u16 + radius as u16,
-                    left_edge as u16 + button_width as u16,
-                ));
-            }
+            drawable.needs_redraw = false;
         }
+
+        let timer_text = format!("{:.1}s", time.start_time.elapsed().as_secs_f64());
+
+        c.set_font_face(&self.fontface);
+        c.set_font_size(12.0);
+
+        let extends = c.text_extents(&timer_text).unwrap();
+        c.move_to(0.0, extends.height());
+        c.set_source_rgb(1.0, 1.0, 1.0);
+        c.show_text(&timer_text).unwrap();
 
         modified_regions
-    }
-
-    fn hit(&self, width: u16, height: u16, x: f64, y: f64, i: Option<usize>) -> Option<usize> {
-        let virtual_button_width =
-            (width as i32 - (BUTTON_SPACING_PX * (self.virtual_button_count - 1) as i32)) as f64
-                / self.virtual_button_count as f64;
-
-        let i = i.unwrap_or_else(|| {
-            let virtual_i = (x / (width as f64 / self.virtual_button_count as f64)) as usize;
-            self.buttons
-                .iter()
-                .position(|(start, _)| *start > virtual_i)
-                .unwrap_or(self.buttons.len())
-                - 1
-        });
-        if i >= self.buttons.len() {
-            return None;
-        }
-
-        let start = self.buttons[i].0;
-        let end = if i + 1 < self.buttons.len() {
-            self.buttons[i + 1].0
-        } else {
-            self.virtual_button_count
-        };
-
-        let left_edge = (start as f64 * (virtual_button_width + BUTTON_SPACING_PX as f64)).floor();
-
-        let button_width = virtual_button_width
-            + ((end - start - 1) as f64 * (virtual_button_width + BUTTON_SPACING_PX as f64))
-                .floor();
-
-        if x < left_edge
-            || x > (left_edge + button_width)
-            || y < 0.1 * height as f64
-            || y > 0.9 * height as f64
-        {
-            return None;
-        }
-
-        Some(i)
     }
 }
 
@@ -504,85 +205,55 @@ impl LibinputInterface for Interface {
     }
 }
 
-fn emit<F>(uinput: &mut UInputHandle<F>, ty: EventKind, code: u16, value: i32)
-where
-    F: AsRawFd,
-{
-    uinput
-        .write(&[input_event {
-            value,
-            type_: ty as u16,
-            code,
-            time: timeval {
-                tv_sec: 0,
-                tv_usec: 0,
-            },
-        }])
-        .unwrap();
+#[derive(Debug)]
+pub struct TimeStep {
+    last_time: Instant,
+    start_time: Instant,
 }
 
-fn toggle_key<F>(uinput: &mut UInputHandle<F>, code: Key, value: i32)
-where
-    F: AsRawFd,
-{
-    emit(uinput, EventKind::Key, code as u16, value);
-    emit(
-        uinput,
-        EventKind::Synchronize,
-        SynchronizeKind::Report as u16,
-        0,
-    );
+impl Default for TimeStep {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TimeStep {
+    pub fn new() -> TimeStep {
+        TimeStep {
+            last_time: Instant::now(),
+            start_time: Instant::now(),
+        }
+    }
+
+    pub fn delta(&mut self) -> f64 {
+        let current_time = Instant::now();
+        let delta = current_time.duration_since(self.last_time).as_secs_f64();
+        self.last_time = current_time;
+        delta
+    }
 }
 
 fn main() {
     let mut drm = DrmBackend::open_card().unwrap();
-    let (height, width) = drm.mode().size();
-    let _ = panic::catch_unwind(AssertUnwindSafe(|| real_main(&mut drm)));
-    let crash_bitmap = include_bytes!("crash_bitmap.raw");
-    let mut map = drm.map().unwrap();
-    let data = map.as_mut();
-    let mut wptr = 0;
-    for byte in crash_bitmap {
-        for i in 0..8 {
-            let bit = ((byte >> i) & 0x1) == 0;
-            let color = if bit { 0xFF } else { 0x0 };
-            data[wptr] = color;
-            data[wptr + 1] = color;
-            data[wptr + 2] = color;
-            data[wptr + 3] = color;
-            wptr += 4;
-        }
+    loop {
+        let _ = panic::catch_unwind(AssertUnwindSafe(|| real_main(&mut drm)));
     }
-    drop(map);
-    drm.dirty(&[ClipRect::new(0, 0, height, width)]).unwrap();
-    let mut sigset = SigSet::empty();
-    sigset.add(Signal::SIGTERM);
-    sigset.wait().unwrap();
 }
 
 fn real_main(drm: &mut DrmBackend) {
     let (height, width) = drm.mode().size();
     let (db_width, db_height) = drm.fb_info().unwrap().size();
-    let mut uinput = UInputHandle::new(OpenOptions::new().write(true).open("/dev/uinput").unwrap());
-    let mut backlight = BacklightManager::new();
-    let mut last_redraw_minute = Local::now().minute();
-    let mut cfg_mgr = ConfigManager::new();
-    let (mut cfg, mut layers) = cfg_mgr.load_config(width);
-    let mut pixel_shift = PixelShiftManager::new();
 
-    // drop privileges to input and video group
-    let groups = ["input", "video"];
+    let dino_png = include_bytes!("dino.png");
+    let dino_surface = try_load_png(&dino_png[..], 40).unwrap();
 
-    PrivDrop::default()
-        .user("nobody")
-        .group_list(&groups)
-        .apply()
-        .unwrap_or_else(|e| panic!("Failed to drop privileges: {}", e));
+    let cactus_png = include_bytes!("cactus.png");
+    let cactus_surface = try_load_png(&cactus_png[..], 24).unwrap();
+
+    let mut scene = Scene::new(dino_surface, cactus_surface);
 
     let mut surface =
         ImageSurface::create(Format::ARgb32, db_width as i32, db_height as i32).unwrap();
-    let mut active_layer = 0;
-    let mut needs_complete_redraw = true;
 
     let mut input_tb = Libinput::new_with_udev(Interface);
     let mut input_main = Libinput::new_with_udev(Interface);
@@ -595,93 +266,96 @@ fn real_main(drm: &mut DrmBackend) {
     epoll
         .add(input_tb.as_fd(), EpollEvent::new(EpollFlags::EPOLLIN, 1))
         .unwrap();
-    epoll
-        .add(cfg_mgr.fd(), EpollEvent::new(EpollFlags::EPOLLIN, 2))
-        .unwrap();
-    uinput.set_evbit(EventKind::Key).unwrap();
-    for layer in &layers {
-        for button in &layer.buttons {
-            uinput.set_keybit(button.1.action).unwrap();
-        }
-    }
     let mut dev_name_c = [0 as c_char; 80];
     let dev_name = "Dynamic Function Row Virtual Input Device".as_bytes();
     for i in 0..dev_name.len() {
         dev_name_c[i] = dev_name[i] as c_char;
     }
-    uinput
-        .dev_setup(&uinput_setup {
-            id: input_id {
-                bustype: 0x19,
-                vendor: 0x1209,
-                product: 0x316E,
-                version: 1,
-            },
-            ff_effects_max: 0,
-            name: dev_name_c,
-        })
-        .unwrap();
-    uinput.dev_create().unwrap();
 
     let mut digitizer: Option<InputDevice> = None;
-    let mut touches = HashMap::new();
+    let mut base_time = TimeStep::new();
+
+    let mut dino_velocity: f64 = 0.0;
+    let da_dino_velocity = &mut dino_velocity as *mut f64;
+
+    let dino = scene.drawables.as_mut_ptr_range().start;
+    let da_dino_too = unsafe { &mut *dino } as *mut Drawable;
+    let tree_num = scene.drawables.len() - 1;
+    let mut rng = rand::thread_rng();
+
+    let mut input_down_time: Option<Instant> = None;
+    let max_down_time = 120;
+
+    let trees = unsafe { scene.drawables.as_mut_ptr().add(1) };
+
+    let player_x_offset = 10.0;
+
+    let jump = |elapsed: u128| unsafe {
+        if (*da_dino_too).y == 0.0 {
+            let clamped_elapsed = elapsed.clamp(50, max_down_time) as f64 / max_down_time as f64;
+            (*da_dino_velocity) += 400.0 * clamped_elapsed.powf(1f64 / 2f64);
+            (*da_dino_too).y += 1.0;
+        }
+    };
+
+    unsafe {
+        (*dino).x = player_x_offset;
+    }
+
     loop {
-        if cfg_mgr.update_config(&mut cfg, &mut layers, width) {
-            active_layer = 0;
-            needs_complete_redraw = true;
-        }
+        let delta = base_time.delta();
+        let game_time = base_time.start_time.elapsed().as_secs_f64();
 
-        let now = Local::now();
-        let ms_left = ((60 - now.second()) * 1000) as i32;
-        let mut next_timeout_ms = min(ms_left, TIMEOUT_MS);
+        unsafe {
+            dino_velocity -= 30.0 * delta * (*dino).y;
 
-        if cfg.enable_pixel_shift {
-            let (pixel_shift_needs_redraw, pixel_shift_next_timeout_ms) = pixel_shift.update();
-            if pixel_shift_needs_redraw {
-                needs_complete_redraw = true;
+            (*dino).y += dino_velocity * delta;
+            if (*dino).y <= 0.0 {
+                (*dino).y = 0.0;
+                dino_velocity = 0.0;
             }
-            next_timeout_ms = min(next_timeout_ms, pixel_shift_next_timeout_ms);
-        }
+            (*dino).needs_redraw = true;
+            
+            let mut offset: f64 = 0.0;
 
-        let current_minute = now.minute();
-        for button in &mut layers[active_layer].buttons {
-            if matches!(button.1.image, ButtonImage::Time(_, _)) && (current_minute != last_redraw_minute) {
-                 needs_complete_redraw = true;
-                 last_redraw_minute = current_minute;
+            for tree_index in 0..tree_num {
+                let da_tree = trees.add(tree_index);
+                (*da_tree).x -= 150.0 * delta * game_time.powf(1f64 / 7f64);
+
+                if (*da_tree).x + (*da_tree).width <= 0.0 {
+                    // reset tree
+                    (*da_tree).x = width as f64 + offset;
+                    offset += rng.gen_range(150.0..500.0);
+                    continue;
+                }
+
+                if (*da_tree).x <= (*dino).width + player_x_offset
+                    && (*da_tree).x > player_x_offset
+                    && (*dino).y <= (*da_tree).height
+                {
+                    // gameover
+                    return ();
+                }
             }
         }
 
-        if needs_complete_redraw || layers[active_layer].buttons.iter().any(|b| b.1.changed) {
-            let shift = if cfg.enable_pixel_shift {
-                pixel_shift.get()
-            } else {
-                (0.0, 0.0)
-            };
-            let clips = layers[active_layer].draw(
-                &cfg,
-                width as i32,
-                height as i32,
-                &surface,
-                shift,
-                needs_complete_redraw,
-            );
-            let data = surface.data().unwrap();
-            drm.map().unwrap().as_mut()[..data.len()].copy_from_slice(&data);
-            drm.dirty(&clips).unwrap();
-            needs_complete_redraw = false;
+        scene.draw(width as i32, height as i32, &surface, &base_time);
+        let data = surface.data().unwrap();
+        drm.map().unwrap().as_mut()[..data.len()].copy_from_slice(&data);
+        drm.dirty(&[ClipRect::new(0, 0, height as u16, width as u16)])
+            .unwrap();
+
+        if let Some(down_time) = input_down_time {
+            if down_time.elapsed().as_millis() >= max_down_time {
+                input_down_time = None;
+                let elapsed = down_time.elapsed().as_millis();
+                (jump)(elapsed);
+            }
         }
 
-        match epoll.wait(
-            &mut [EpollEvent::new(EpollFlags::EPOLLIN, 0)],
-            next_timeout_ms as u16,
-        ) {
-            Err(Errno::EINTR) | Ok(_) => 0,
-            e => e.unwrap(),
-        };
         input_tb.dispatch().unwrap();
         input_main.dispatch().unwrap();
         for event in &mut input_tb.clone().chain(input_main.clone()) {
-            backlight.process_event(&event);
             match event {
                 Event::Device(DeviceEvent::Added(evt)) => {
                     let dev = evt.device();
@@ -689,52 +363,25 @@ fn real_main(drm: &mut DrmBackend) {
                         digitizer = Some(dev);
                     }
                 }
-                Event::Keyboard(KeyboardEvent::Key(key)) => {
-                    if key.key() == Key::Fn as u32 {
-                        let new_layer = match key.key_state() {
-                            KeyState::Pressed => 1,
-                            KeyState::Released => 0,
-                        };
-                        if active_layer != new_layer {
-                            active_layer = new_layer;
-                            needs_complete_redraw = true;
-                        }
-                    }
-                }
                 Event::Touch(te) => {
-                    if Some(te.device()) != digitizer || backlight.current_bl() == 0 {
+                    if Some(te.device()) != digitizer {
                         continue;
                     }
                     match te {
-                        TouchEvent::Down(dn) => {
-                            let x = dn.x_transformed(width as u32);
-                            let y = dn.y_transformed(height as u32);
-                            if let Some(btn) = layers[active_layer].hit(width, height, x, y, None) {
-                                touches.insert(dn.seat_slot(), (active_layer, btn));
-                                layers[active_layer].buttons[btn]
-                                    .1
-                                    .set_active(&mut uinput, true);
+                        TouchEvent::Down(_dn) => {
+                            input_down_time = Some(Instant::now());
+                        }
+                        TouchEvent::Motion(_mtn) => {
+                            if input_down_time.is_none() {
+                                input_down_time = Some(Instant::now());
                             }
                         }
-                        TouchEvent::Motion(mtn) => {
-                            if !touches.contains_key(&mtn.seat_slot()) {
-                                continue;
+                        TouchEvent::Up(_up) => {
+                            if let Some(down_time) = input_down_time {
+                                input_down_time = None;
+                                let elapsed = down_time.elapsed().as_millis();
+                                (jump)(elapsed);
                             }
-
-                            let x = mtn.x_transformed(width as u32);
-                            let y = mtn.y_transformed(height as u32);
-                            let (layer, btn) = *touches.get(&mtn.seat_slot()).unwrap();
-                            let hit = layers[active_layer]
-                                .hit(width, height, x, y, Some(btn))
-                                .is_some();
-                            layers[layer].buttons[btn].1.set_active(&mut uinput, hit);
-                        }
-                        TouchEvent::Up(up) => {
-                            if !touches.contains_key(&up.seat_slot()) {
-                                continue;
-                            }
-                            let (layer, btn) = *touches.get(&up.seat_slot()).unwrap();
-                            layers[layer].buttons[btn].1.set_active(&mut uinput, false);
                         }
                         _ => {}
                     }
@@ -742,6 +389,10 @@ fn real_main(drm: &mut DrmBackend) {
                 _ => {}
             }
         }
-        backlight.update_backlight(&cfg);
+
+        let sleep_time = (1 / 144) as f64 - delta;
+        if sleep_time > 0.0 {
+            thread::sleep(Duration::from_secs(sleep_time as u64));
+        }
     }
 }
