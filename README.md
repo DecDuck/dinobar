@@ -24,6 +24,11 @@ Instead, we made a dinosaur jump on a 2170 x 60 pixel strip of OLED. You're welc
 - Fully optimized for the 1% of your MacBook that's _least relevant to productivity_.
 - No internet required — just like the original, but worse!
 
+## Controls
+
+Tap the Touch Bar to jump.
+That’s it. There is no step 2.
+
 ## Why have a README
 
 I added a README because people said my other touchbar project didn't have one.
